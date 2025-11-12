@@ -1,63 +1,84 @@
+# app.py
 from flask import Flask, request, jsonify
-import requests
 import os
+import requests
 
 app = Flask(__name__)
 
-# === 读取环境变量（从 Render 设置中读取 API 密钥）===
-LTX_API_KEY = os.getenv("LTX_API_KEY")
-SHARED_SECRET = os.getenv("SHARED_SECRET")
+# 从 Render 环境变量读取密钥
+LTX_API_KEY = os.getenv("LTX_API_KEY", "")
 
-# === Cloudflare Worker 地址（替换为你自己的 Worker 链接）===
-CLOUDFLARE_WORKER_URL = "https://flat-dream-2ae2.r18740635243.workers.dev"
-
-
-# === 首页测试接口 ===
-@app.route('/')
+# 主页：显示已暴露的端点，便于排查
+@app.route("/")
 def home():
     return jsonify({
-        "message": "LTX proxy is running via Cloudflare Worker",
-        "endpoints": ["/ping", "/ltx"]
+        "message": "LTX proxy is running on Render",
+        "endpoints": ["/ping", "/ltx", "/internal-ltx", "/routes"]
     })
 
-
-# === 健康检测接口 ===
-@app.route('/ping')
+# 健康检查
+@app.route("/ping")
 def ping():
     return jsonify({"status": "ok"})
 
+# 列出当前所有路由（诊断用）
+@app.route("/routes")
+def routes():
+    rules = sorted([r.rule for r in app.url_map.iter_rules()])
+    return jsonify({"routes": rules})
 
-# === 主要的 LTX Studio 转发接口 ===
-@app.route("/ltx", methods=["POST"])
-def proxy_ltx():
+def _call_ltx_api(prompt: str, resolution: str = "720p"):
+    if not LTX_API_KEY:
+        return {"error": "LTX_API_KEY is empty/not set in Render env"}, 500
+
+    payload = {
+        "prompt": prompt,
+        "resolution": resolution or "720p"
+    }
+    headers = {
+        "Authorization": f"Bearer {LTX_API_KEY}",
+        "Content-Type": "application/json"
+    }
     try:
-        data = request.get_json()
+        r = requests.post(
+            "https://api.ltxstudio.com/v1/videos",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        # 直接把上游的 JSON 返回
+        return r.json(), r.status_code
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+# 公开给你直接调用的端点
+@app.route("/ltx", methods=["POST"])
+def ltx():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
         prompt = data.get("prompt")
         resolution = data.get("resolution", "720p")
-
         if not prompt:
-            return jsonify({"error": "Missing 'prompt' field"}), 400
-
-        payload = {
-            "prompt": prompt,
-            "resolution": resolution
-        }
-
-        headers = {
-            "Authorization": f"Bearer {LTX_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        # 向 LTX Studio 发送请求
-        r = requests.post("https://api.ltxstudio.com/v1/videos", headers=headers, json=payload)
-
-        # 返回 LTX Studio 的原始响应
-        return jsonify(r.json()), r.status_code
-
+            return jsonify({"error": "missing 'prompt'"}), 400
+        body, status = _call_ltx_api(prompt, resolution)
+        return jsonify(body), status
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# 供 Cloudflare Worker 转发用（路径与 Worker 中保持一致）
+@app.route("/internal-ltx", methods=["POST"])
+def internal_ltx():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        prompt = data.get("prompt")
+        resolution = data.get("resolution", "720p")
+        if not prompt:
+            return jsonify({"error": "missing 'prompt'"}), 400
+        body, status = _call_ltx_api(prompt, resolution)
+        return jsonify(body), status
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# === 启动 Flask 服务 ===
 if __name__ == "__main__":
+    # 本地/Render 通用
     app.run(host="0.0.0.0", port=10000)
